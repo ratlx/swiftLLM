@@ -8,13 +8,25 @@ import uvicorn
 
 import swiftllm
 
+from pydantic import BaseModel
+from typing import Optional
+
+import json
+from transformers import AutoTokenizer
+
 TIMEOUT_KEEP_ALIVE = 5  # in seconds
 
 app = fastapi.FastAPI()
 engine = None
 
+class GenerateRequest(BaseModel):
+    prompt: str
+    output_len: int
+    stream: Optional[bool] = False
+    decode: Optional[bool] = True
+
 @app.post("/generate")
-async def generate(req: fastapi.Request) -> fastapi.Response:
+async def generate(req: GenerateRequest) -> fastapi.Response:
     """
     Generate completion for the request.
 
@@ -23,25 +35,22 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
     - `stream`: boolean, whether to stream the output or not
     - `decode`: boolean, whether to decode the output tokens (default: True)
     """
-    req_dict = await req.json()
     raw_request = swiftllm.RawRequest(
-        prompt = req_dict["prompt"],
-        output_len = req_dict["output_len"]
+        prompt=req.prompt,
+        output_len=req.output_len
     )
-    # Whether to decode the output
-    decode_output = req_dict.get("decode", False)
 
-    if req_dict.get("stream", False):
+    if req.stream:
         generator = engine.add_request_and_stream(raw_request)
         async def wrapper():
             output_token_ids = []
             prev_decoded = ""
-            
+
             async for step_output in generator:
                 token_id = step_output.token_id
                 output_token_ids.append(token_id)
-                
-                if decode_output:
+
+                if req.decode:
                     # Only decode new tokens
                     try:
                         # Decode current token individually
@@ -55,7 +64,7 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
                             # Extract new content from combined result
                             if last_two and len(last_two) > len(prev_decoded):
                                 new_token = last_two[len(prev_decoded):]
-                        
+
                         prev_decoded += new_token
                         yield f"{prev_decoded}\n"
                     except Exception:
@@ -66,7 +75,7 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
                 else:
                     # Output token ID without decoding
                     yield f"{token_id}\n"
-        
+
         return fastapi.responses.StreamingResponse(
             wrapper(),
             media_type="text/plain"
@@ -74,19 +83,73 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
     else:
         # TODO Abort the request when the client disconnects
         (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
-        
+
         response_content = {"output_token_ids": output_token_ids}
-        
-        if decode_output:
+
+        if req.decode:
             decoded = await engine.tokenization_engine.decode.remote(output_token_ids, skip_special_tokens=True)
             response_content["output"] = decoded
-        
+
         return fastapi.responses.JSONResponse(content=response_content)
+
+@app.post("/v1/completions")
+async def openai_completions(req: fastapi.Request):
+    req_json = await req.json()
+    prompt = req_json["prompt"]
+    max_tokens = req_json.get("max_tokens", 128)
+    stream = req_json.get("stream", False)
+
+    raw_request = swiftllm.RawRequest(prompt=prompt, output_len=max_tokens)
+    tokenizer = AutoTokenizer.from_pretrained("/home/ratlx/xxq/Llama-3.2-1B-Instruct")
+
+    if not stream:
+        _, output_token_ids = await engine.add_request_and_wait(raw_request)
+        output_text = tokenizer.decode(output_token_ids)
+        return fastapi.responses.JSONResponse(
+            content={
+                "id": "cmpl-swift-test",
+                "object": "text_completion",
+                "created": 0,
+                "model": "swift",
+                "choices": [{
+                    "text": output_text,
+                    "index": 0,
+                    "logprobs": None,
+                    "finish_reason": "stop"
+                }]
+            }
+        )
+    else:
+        generator = engine.add_request_and_stream(raw_request)
+
+        async def stream_generator():
+            async for step_output in generator:
+                token_text = tokenizer.decode([step_output.token_id])
+                data = {
+                    "id": "cmpl-swift-test",
+                    "object": "text_completion",
+                    "created": 0,
+                    "model": "swift",
+                    "choices": [{
+                        "text": token_text,
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return fastapi.responses.StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream"
+        )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="localhost")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=9090)
     swiftllm.EngineConfig.add_cli_args(parser)
 
     args = parser.parse_args()
